@@ -1,0 +1,887 @@
+--// ============================================================
+--//  [Boss] Bắt Một Tỷ Vịt — Script Hub
+--//  Chức năng: ESP Vịt | Aimbot | Auto Kill | Menu hiện đại
+--//  Game: [Boss🔥] Bắt một tỷ vịt  (PlaceId: 100293509865504)
+--//  Ngôn ngữ: Lua / Luau (chạy trên executor Roblox mobile/PC)
+--// ============================================================
+
+if getgenv and getgenv()._BatVitHubLoaded then
+    pcall(function() getgenv()._BatVitHubLoaded:Destroy() end)
+end
+
+--// Services
+local Players         = game:GetService("Players")
+local LocalPlayer     = Players.LocalPlayer
+local Camera          = workspace.CurrentCamera
+local RunService      = game:GetService("RunService")
+local UserInputService= game:GetService("UserInputService")
+local TweenService    = game:GetService("TweenService")
+local HttpService     = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+--// Cấu hình mặc định (có thể đổi trong menu)
+local Config = {
+    -- ESP
+    ESP_Enabled      = true,
+    ESP_Color        = Color3.fromRGB(255, 190, 40),
+    ESP_UseHighlight = true,
+    ESP_Name         = true,
+    ESP_Distance     = true,
+    ESP_Tracer       = true,
+    ESP_MaxDistance  = 2500,
+    -- Aimbot
+    Aim_Enabled      = false,
+    Aim_Toggle       = false,          -- false = giữ phím, true = bật/tắt
+    Aim_Key          = Enum.UserInputType.MouseButton2,
+    Aim_FOV          = 220,            -- pixel
+    Aim_Smooth       = 0.35,           -- 0 = instant, 1 = rất mượt
+    Aim_Prediction   = 0.12,           -- giây đoán trước chuyển động
+    Aim_TargetPart   = "Head",         -- Head / HumanoidRootPart / PrimaryPart
+    -- Auto Kill
+    AutoKill_Enabled = false,
+    AutoKill_Delay   = 0.15,           -- giây giữa 2 lần bắn
+    AutoKill_Range   = 5000,
+    AutoKill_InstantAim = true,        -- aim tức thì khi auto kill
+    -- Khác
+    MenuKey          = Enum.KeyCode.RightControl,
+    AccentColor      = Color3.fromRGB(255, 185, 50),
+}
+
+--// Trạng thái nội bộ
+local State = {
+    MenuOpen       = true,
+    AimHolding     = false,
+    CurrentTarget  = nil,
+    Ducks          = {},               -- [model] = { esp objects }
+    ShootRemotes   = {},
+    ScanTick       = 0,
+}
+
+--// ============================================================
+--//  UTIL
+--// ============================================================
+local function safe(f, ...)
+    local ok, r = pcall(f, ...)
+    if ok then return r end
+    return nil
+end
+
+local function getRootPart(model)
+    if not model or not model.Parent then return nil end
+    if model:IsA("BasePart") then return model end
+    local hp = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("RootPart") or model:FindFirstChild("Torso")
+    if hp and hp:IsA("BasePart") then return hp end
+    if model.PrimaryPart then return model.PrimaryPart end
+    -- fallback: part toạ độ trung tâm
+    local head = model:FindFirstChild("Head")
+    if head and head:IsA("BasePart") then return head end
+    for _, p in ipairs(model:GetDescendants()) do
+        if p:IsA("BasePart") then return p end
+    end
+    return nil
+end
+
+local function getDuckVelocity(model)
+    local root = getRootPart(model)
+    if root then
+        return root.Velocity or root.AssemblyLinearVelocity or Vector3.zero
+    end
+    return Vector3.zero
+end
+
+local function getTargetPosition(duck)
+    local root = getRootPart(duck)
+    if not root then return nil end
+    local pos = root.Position
+    -- Ưu tiên Head nếu có
+    local head = duck:FindFirstChild("Head")
+    if head and head:IsA("BasePart") then pos = head.Position end
+    if Config.Aim_Prediction > 0 then
+        pos = pos + getDuckVelocity(duck) * Config.Aim_Prediction
+    end
+    return pos
+end
+
+--// ============================================================
+--//  PHÁT HIỆN VỊT (adaptive — quét workspace)
+--// ============================================================
+local DUCK_NAME_PATTERNS = {
+    "duck", "vit", "vịt", "bird", "mallard", "goose", "ngỗng", "ngong",
+    "duckling", "convit", "con_vit", "target", "mob", "npc", "animal",
+    "enemy", "flying", "bay", "chicken", "ga", "gà", "pigeon", "bồ câu",
+    "seagull", "hawk", "eagle", "crow", "sparrow",
+}
+local DUCK_FOLDER_PATTERNS = {
+    "duck", "vit", "vịt", "bird", "npc", "mob", "animal", "entity",
+    "target", "enemy", "wildlife", "spawn", "flying",
+}
+local BLACKLIST_PATTERNS = {
+    "player", "local", "camera", "terrain", "baseplate", "map", "world",
+    "weapon", "tool", "gun", "sung", "bullet", "projectile", "effect",
+    "particle", "debris", "sound", "gui", "menu",
+}
+
+local function nameMatches(name, patterns)
+    local low = string.lower(tostring(name or ""))
+    for _, p in ipairs(patterns) do
+        if string.find(low, string.lower(p), 1, true) then return true end
+    end
+    return false
+end
+
+local function isBlacklisted(name)
+    return nameMatches(name, BLACKLIST_PATTERNS)
+end
+
+local function isPlayerCharacter(model)
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Character == model then return true end
+    end
+    return false
+end
+
+local function looksLikeDuck(model)
+    if not model or not model:IsA("Model") then return false end
+    if isPlayerCharacter(model) then return false end
+    local name = model.Name
+    if isBlacklisted(name) then return false end
+    -- Có Humanoid (NPC) → gần như chắc chắn là mob/vịt
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    if hum then
+        -- Loại trừ player character (đã check ở trên)
+        return true
+    end
+    -- Tên trùng pattern vịt
+    if nameMatches(name, DUCK_NAME_PATTERNS) then
+        return true
+    end
+    -- Nằm trong folder có tên vịt/mob
+    local parent = model.Parent
+    while parent and parent ~= workspace do
+        if nameMatches(parent.Name, DUCK_FOLDER_PATTERNS) and not isBlacklisted(parent.Name) then
+            return true
+        end
+        parent = parent.Parent
+    end
+    return false
+end
+
+local function scanDucks()
+    local found = {}
+    local function check(obj)
+        if looksLikeDuck(obj) and getRootPart(obj) then
+            found[obj] = true
+        end
+    end
+    -- Quét các folder con trực tiếp của workspace (nhanh)
+    for _, child in ipairs(workspace:GetChildren()) do
+        if child:IsA("Model") then
+            check(child)
+            -- Nếu là folder chứa nhiều vịt, quét tiếp con
+            for _, sub in ipairs(child:GetChildren()) do
+                if sub:IsA("Model") then check(sub) end
+            end
+        elseif child:IsA("Folder") then
+            for _, sub in ipairs(child:GetChildren()) do
+                if sub:IsA("Model") then check(sub) end
+            end
+        end
+    end
+    return found
+end
+
+--// ============================================================
+--//  ESP VỊT (Highlight + Billboard + Tracer)
+--// ============================================================
+local EspFolder = safe(function()
+    local f = Instance.new("Folder")
+    f.Name = "VitHub_ESP"
+    f.Parent = gethui and gethui() or game:GetService("CoreGui")
+    return f
+end) or Instance.new("Folder", workspace)
+
+local function removeEsp(duck)
+    local data = State.Ducks[duck]
+    if data then
+        safe(function() if data.highlight then data.highlight:Destroy() end end)
+        safe(function() if data.billboard then data.billboard:Destroy() end end)
+        safe(function() if data.tracer then data.tracer:Destroy() end end)
+        State.Ducks[duck] = nil
+    end
+end
+
+local function createEsp(duck)
+    if State.Ducks[duck] then return end
+    local root = getRootPart(duck)
+    if not root then return end
+
+    local highlight
+    if Config.ESP_UseHighlight then
+        highlight = Instance.new("Highlight")
+        highlight.Name = "VitHighlight"
+        highlight.FillColor = Config.ESP_Color
+        highlight.FillTransparency = 0.55
+        highlight.OutlineColor = Config.ESP_Color
+        highlight.OutlineTransparency = 0
+        highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        highlight.Adornee = duck
+        highlight.Parent = EspFolder
+    end
+
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "VitLabel"
+    billboard.Adornee = root
+    billboard.Size = UDim2.new(0, 140, 0, 42)
+    billboard.StudsOffset = Vector3.new(0, 2.5, 0)
+    billboard.AlwaysOnTop = true
+    billboard.Parent = EspFolder
+
+    local nameLbl = Instance.new("TextLabel")
+    nameLbl.BackgroundTransparency = 1
+    nameLbl.Size = UDim2.new(1, 0, 0.5, 0)
+    nameLbl.Font = Enum.Font.GothamBold
+    nameLbl.TextSize = 13
+    nameLbl.TextColor3 = Color3.fromRGB(255, 255, 255)
+    nameLbl.TextStrokeTransparency = 0.4
+    nameLbl.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+    nameLbl.Text = "🦆 VỊT"
+    nameLbl.Parent = billboard
+
+    local distLbl = Instance.new("TextLabel")
+    distLbl.BackgroundTransparency = 1
+    distLbl.Position = UDim2.new(0, 0, 0.5, 0)
+    distLbl.Size = UDim2.new(1, 0, 0.5, 0)
+    distLbl.Font = Enum.Font.Gotham
+    distLbl.TextSize = 11
+    distLbl.TextColor3 = Config.ESP_Color
+    distLbl.TextStrokeTransparency = 0.5
+    distLbl.Text = ""
+    distLbl.Parent = billboard
+
+    -- Tracer (đường kẻ từ dưới màn hình lên vịt) — dùng Drawing API nếu có
+    local tracer = nil
+    if Drawing and Drawing.new then
+        safe(function()
+            tracer = Drawing.new("Line")
+            tracer.Visible = false
+            tracer.Color = Config.ESP_Color
+            tracer.Thickness = 1.5
+            tracer.Transparency = 0.8
+        end)
+    end
+
+    State.Ducks[duck] = {
+        highlight = highlight,
+        billboard = billboard,
+        nameLbl = nameLbl,
+        distLbl = distLbl,
+        tracer = tracer,
+        root = root,
+    }
+end
+
+local function updateEsp()
+    -- Quét lại mỗi 1.5s
+    State.ScanTick = State.ScanTick + 1
+    if State.ScanTick % 90 == 0 then
+        local found = scanDucks()
+        -- Xóa vịt không còn
+        for duck in pairs(State.Ducks) do
+            if not found[duck] or not duck.Parent then
+                removeEsp(duck)
+            end
+        end
+        -- Thêm vịt mới
+        for duck in pairs(found) do
+            if Config.ESP_Enabled then createEsp(duck) end
+        end
+    end
+
+    -- Cập nhật label + tracer
+    local myChar = LocalPlayer.Character
+    local myRoot = myChar and safe(function() return myChar.PrimaryPart or myChar:FindFirstChild("HumanoidRootPart") end)
+    local cam = workspace.CurrentCamera
+
+    for duck, data in pairs(State.Ducks) do
+        if not duck.Parent or not getRootPart(duck) then
+            removeEsp(duck)
+        else
+            local root = data.root
+            -- Bật/tắt theo config
+            if data.highlight then data.highlight.Enabled = Config.ESP_Enabled and Config.ESP_UseHighlight end
+            if data.billboard then data.billboard.Enabled = Config.ESP_Enabled and (Config.ESP_Name or Config.ESP_Distance) end
+            if not Config.ESP_Enabled then
+                if data.tracer then data.tracer.Visible = false end
+            else
+                local pos = root.Position
+                local dist = myRoot and (myRoot.Position - pos).Magnitude or 0
+                if dist > Config.ESP_MaxDistance then
+                    if data.billboard then data.billboard.Enabled = false end
+                    if data.highlight then data.highlight.Enabled = false end
+                    if data.tracer then data.tracer.Visible = false end
+                else
+                    if data.distLbl then
+                        data.distLbl.Text = Config.ESP_Distance and string.format("%.0f studs", dist) or ""
+                    end
+                    if data.nameLbl then
+                        data.nameLbl.Text = Config.ESP_Name and "🦆 VỊT" or ""
+                    end
+                    -- Tracer
+                    if Config.ESP_Tracer and data.tracer and cam then
+                        local vec, onScreen = cam:WorldToViewportPoint(pos)
+                        if onScreen then
+                            data.tracer.From = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y)
+                            data.tracer.To = Vector2.new(vec.X, vec.Y)
+                            data.tracer.Visible = true
+                            data.tracer.Color = Config.ESP_Color
+                        else
+                            data.tracer.Visible = false
+                        end
+                    elseif data.tracer then
+                        data.tracer.Visible = false
+                    end
+                end
+            end
+        end
+    end
+end
+
+--// ============================================================
+--//  AIMBOT — tìm vịt gần crosshair nhất trong FOV
+--// ============================================================
+local function findBestTarget()
+    local cam = workspace.CurrentCamera
+    local mouseCenter = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y / 2)
+    local best, bestDist = nil, Config.Aim_FOV
+
+    for duck in pairs(State.Ducks) do
+        if duck.Parent then
+            local pos = getTargetPosition(duck)
+            if pos then
+                local vec, onScreen = cam:WorldToViewportPoint(pos)
+                if onScreen and vec.Z > 0 then
+                    local d = (Vector2.new(vec.X, vec.Y) - mouseCenter).Magnitude
+                    if d < bestDist then
+                        -- Kiểm tra khoảng cách 3D
+                        local myChar = LocalPlayer.Character
+                        local myRoot = myChar and safe(function() return myChar.PrimaryPart or myChar:FindFirstChild("HumanoidRootPart") end)
+                        local dist3d = myRoot and (myRoot.Position - pos).Magnitude or 0
+                        if dist3d <= Config.AutoKill_Range then
+                            best, bestDist = duck, d
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function aimAt(targetPos, smooth)
+    local cam = workspace.CurrentCamera
+    local myChar = LocalPlayer.Character
+    local myRoot = myChar and safe(function() return myChar.PrimaryPart or myChar:FindFirstChild("HumanoidRootPart") end)
+    if not myRoot then return end
+    local goal = CFrame.new(cam.CFrame.Position, targetPos)
+    if smooth and smooth > 0.01 then
+        cam.CFrame = cam.CFrame:Lerp(goal, 1 - smooth)
+    else
+        cam.CFrame = goal
+    end
+end
+
+--// ============================================================
+--//  AUTO KILL — tự động bắn toàn bộ vịt
+--// ============================================================
+local function getEquippedTool()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    for _, c in ipairs(char:GetChildren()) do
+        if c:IsA("Tool") then return c end
+    end
+    return nil
+end
+
+local function scanShootRemotes()
+    State.ShootRemotes = {}
+    local containers = { ReplicatedStorage, workspace }
+    local char = LocalPlayer.Character
+    if char then table.insert(containers, char) end
+    local tool = getEquippedTool()
+    if tool then table.insert(containers, tool) end
+
+    local patterns = { "shoot", "fire", "ban", "bắn", "attack", "hit", "damage",
+        "kill", "catch", "bắt", "bat", "vit", "vịt", "duck", "bullet",
+        "projectile", "weapon", "gun", "sung", "súng", "remote" }
+
+    for _, cont in ipairs(containers) do
+        safe(function()
+            for _, d in ipairs(cont:GetDescendants()) do
+                if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
+                    if nameMatches(d.Name, patterns) and not isBlacklisted(d.Name) then
+                        table.insert(State.ShootRemotes, d)
+                    end
+                end
+            end
+        end)
+    end
+    -- Bỏ trùng
+    local seen = {}
+    local uniq = {}
+    for _, r in ipairs(State.ShootRemotes) do
+        if not seen[r] then seen[r] = true; table.insert(uniq, r) end
+    end
+    State.ShootRemotes = uniq
+end
+
+local function fireWeapon(targetDuck)
+    local fired = false
+    -- Cách 1: Kích hoạt Tool (gây sự kiện Activated cho local script của súng)
+    local tool = getEquippedTool()
+    if tool then
+        safe(function() tool:Activate() fired = true end)
+        -- Cách 2: Fire remotes trong tool
+        safe(function()
+            for _, d in ipairs(tool:GetDescendants()) do
+                if d:IsA("RemoteEvent") then
+                    local pos = getTargetPosition(targetDuck)
+                    pcall(function() d:FireServer(targetDuck, pos) end)
+                    pcall(function() d:FireServer(pos) end)
+                    pcall(function() d:FireServer(targetDuck) end)
+                    fired = true
+                elseif d:IsA("RemoteFunction") then
+                    local pos = getTargetPosition(targetDuck)
+                    pcall(function() d:InvokeServer(targetDuck, pos) end)
+                    pcall(function() d:InvokeServer(pos) end)
+                    fired = true
+                end
+            end
+        end)
+    end
+    -- Cách 3: Fire các remote đã scan
+    for _, r in ipairs(State.ShootRemotes) do
+        if r and r.Parent then
+            local pos = getTargetPosition(targetDuck)
+            if r:IsA("RemoteEvent") then
+                pcall(function() r:FireServer(targetDuck, pos) end)
+                pcall(function() r:FireServer(pos) end)
+                pcall(function() r:FireServer(targetDuck) end)
+                fired = true
+            else
+                pcall(function() r:InvokeServer(targetDuck, pos) end)
+                pcall(function() r:InvokeServer(pos) end)
+                fired = true
+            end
+        end
+    end
+    return fired
+end
+
+--// Loop auto kill (chạy nền)
+task.spawn(function()
+    while true do
+        task.wait(Config.AutoKill_Delay)
+        if Config.AutoKill_Enabled then
+            -- Quét lại vịt trước khi bắn
+            if #State.ShootRemotes == 0 then scanShootRemotes() end
+            local target = findBestTarget()
+            if target then
+                State.CurrentTarget = target
+                local pos = getTargetPosition(target)
+                if pos then
+                    if Config.AutoKill_InstantAim then
+                        aimAt(pos, 0)
+                    else
+                        aimAt(pos, Config.Aim_Smooth)
+                    end
+                    task.wait(0.02)
+                    fireWeapon(target)
+                end
+            end
+        end
+    end
+end)
+
+--// ============================================================
+--//  RENDER LOOP — ESP + Aimbot
+--// ============================================================
+RunService.RenderStepped:Connect(function()
+    updateEsp()
+
+    -- Aimbot: bật khi giữ phím (hoặc toggle)
+    local aimActive = Config.Aim_Enabled and (Config.Aim_Toggle and State.AimHolding or (not Config.Aim_Toggle and State.AimHolding))
+    if aimActive then
+        local target = findBestTarget()
+        if target then
+            State.CurrentTarget = target
+            local pos = getTargetPosition(target)
+            if pos then aimAt(pos, Config.Aim_Smooth) end
+        end
+    elseif not Config.AutoKill_Enabled then
+        State.CurrentTarget = nil
+    end
+end)
+
+--// Input: giữ phím aim
+UserInputService.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    if input.UserInputType == Config.Aim_Key or input.KeyCode == Config.Aim_Key then
+        State.AimHolding = true
+    end
+    if input.KeyCode == Config.MenuKey then
+        State.MenuOpen = not State.MenuOpen
+        if State.MenuFrame then State.MenuFrame.Visible = State.MenuOpen end
+    end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Config.Aim_Key or input.KeyCode == Config.Aim_Key then
+        if not Config.Aim_Toggle then State.AimHolding = false end
+    end
+end)
+
+--// ============================================================
+--//  GUI — Menu hiện đại (dark + accent vàng)
+--// ============================================================
+local function getGuiParent()
+    if gethui then
+        local ok, h = pcall(gethui)
+        if ok and h then return h end
+    end
+    if syn and syn.protect_gui then return game:GetService("CoreGui") end
+    local ok, c = pcall(function() return game:GetService("CoreGui") end)
+    if ok and c then return c end
+    return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "VitHub_Menu"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.IgnoreGuiInset = true
+if syn and syn.protect_gui then pcall(syn.protect_gui, ScreenGui) end
+ScreenGui.Parent = getGuiParent()
+
+if getgenv then getgenv()._BatVitHubLoaded = ScreenGui end
+
+local accent = Config.AccentColor
+
+--// Main frame
+local Main = Instance.new("Frame")
+Main.Name = "MainFrame"
+Main.Size = UDim2.new(0, 420, 0, 520)
+Main.Position = UDim2.new(0.5, -210, 0.5, -260)
+Main.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+Main.BorderSizePixel = 0
+Main.Active = true
+Main.Draggable = true
+Main.Parent = ScreenGui
+State.MenuFrame = Main
+Instance.new("UICorner", Main).CornerRadius = UDim.new(0, 14)
+
+local MainStroke = Instance.new("UIStroke")
+MainStroke.Color = accent
+MainStroke.Thickness = 1.2
+MainStroke.Transparency = 0.3
+MainStroke.Parent = Main
+
+--// Header
+local Header = Instance.new("Frame")
+Header.Size = UDim2.new(1, 0, 0, 46)
+Header.BackgroundColor3 = Color3.fromRGB(24, 24, 30)
+Header.BorderSizePixel = 0
+Header.Parent = Main
+local hc = Instance.new("UICorner", Header); hc.CornerRadius = UDim.new(0, 14)
+local HeaderFix = Instance.new("Frame")
+HeaderFix.Size = UDim2.new(1, 0, 0.5, 0)
+HeaderFix.Position = UDim2.new(0, 0, 0.5, 0)
+HeaderFix.BackgroundColor3 = Color3.fromRGB(24, 24, 30)
+HeaderFix.BorderSizePixel = 0
+HeaderFix.Parent = Header
+
+local HeaderGrad = Instance.new("UIGradient")
+HeaderGrad.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, accent),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(120, 70, 10)),
+})
+HeaderGrad.Rotation = 90
+HeaderGrad.Parent = Header
+
+local Title = Instance.new("TextLabel")
+Title.Size = UDim2.new(1, -80, 1, 0)
+Title.Position = UDim2.new(0, 16, 0, 0)
+Title.BackgroundTransparency = 1
+Title.Text = "🦆 VỊT HUB  ·  Bắt Một Tỷ Vịt"
+Title.TextColor3 = Color3.fromRGB(255, 255, 255)
+Title.TextSize = 15
+Title.Font = Enum.Font.GothamBold
+Title.TextXAlignment = Enum.TextXAlignment.Left
+Title.Parent = Header
+
+local CloseBtn = Instance.new("TextButton")
+CloseBtn.Size = UDim2.new(0, 32, 0, 24)
+CloseBtn.Position = UDim2.new(1, -40, 0, 11)
+CloseBtn.BackgroundColor3 = Color3.fromRGB(180, 50, 60)
+CloseBtn.Text = "✕"
+CloseBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+CloseBtn.TextSize = 13
+CloseBtn.Font = Enum.Font.GothamBold
+CloseBtn.Parent = Header
+Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 6)
+CloseBtn.MouseButton1Click:Connect(function()
+    State.MenuOpen = false
+    Main.Visible = false
+end)
+
+--// Scrolling content
+local Content = Instance.new("ScrollingFrame")
+Content.Size = UDim2.new(1, -20, 1, -60)
+Content.Position = UDim2.new(0, 10, 0, 52)
+Content.BackgroundTransparency = 1
+Content.BorderSizePixel = 0
+Content.ScrollBarThickness = 4
+Content.ScrollBarImageColor3 = accent
+Content.CanvasSize = UDim2.new(0, 0, 0, 0)
+Content.AutomaticCanvasSize = Enum.AutomaticSize.Y
+Content.Parent = Main
+local listLayout = Instance.new("UIListLayout", Content)
+listLayout.Padding = UDim.new(0, 8)
+listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+local function makeSection(name)
+    local sec = Instance.new("Frame")
+    sec.Size = UDim2.new(1, 0, 0, 28)
+    sec.BackgroundTransparency = 1
+    sec.Parent = Content
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, 0, 1, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = "▸ " .. string.upper(name)
+    lbl.TextColor3 = accent
+    lbl.TextSize = 12
+    lbl.Font = Enum.Font.GothamBold
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = sec
+    return sec
+end
+
+local function makeToggle(text, configKey, callback)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, 0, 0, 34)
+    row.BackgroundColor3 = Color3.fromRGB(28, 28, 34)
+    row.BorderSizePixel = 0
+    row.Parent = Content
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -60, 1, 0)
+    lbl.Position = UDim2.new(0, 12, 0, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = text
+    lbl.TextColor3 = Color3.fromRGB(220, 220, 225)
+    lbl.TextSize = 13
+    lbl.Font = Enum.Font.Gotham
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = row
+
+    local toggle = Instance.new("TextButton")
+    toggle.Size = UDim2.new(0, 40, 0, 22)
+    toggle.Position = UDim2.new(1, -50, 0.5, -11)
+    toggle.BackgroundColor3 = Config[configKey] and accent or Color3.fromRGB(60, 60, 68)
+    toggle.Text = ""
+    toggle.AutoButtonColor = false
+    toggle.Parent = row
+    Instance.new("UICorner", toggle).CornerRadius = UDim.new(1, 0)
+
+    local knob = Instance.new("Frame")
+    knob.Size = UDim2.new(0, 16, 0, 16)
+    knob.Position = Config[configKey] and UDim2.new(1, -18, 0.5, -8) or UDim2.new(0, 2, 0.5, -8)
+    knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    knob.BorderSizePixel = 0
+    knob.Parent = toggle
+    Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+
+    toggle.MouseButton1Click:Connect(function()
+        Config[configKey] = not Config[configKey]
+        TweenService:Create(toggle, TweenInfo.new(0.18), {
+            BackgroundColor3 = Config[configKey] and accent or Color3.fromRGB(60, 60, 68)
+        }):Play()
+        TweenService:Create(knob, TweenInfo.new(0.18), {
+            Position = Config[configKey] and UDim2.new(1, -18, 0.5, -8) or UDim2.new(0, 2, 0.5, -8)
+        }):Play()
+        if callback then callback(Config[configKey]) end
+    end)
+    return row
+end
+
+local function makeSlider(text, configKey, min, max, suffix, callback)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, 0, 0, 52)
+    row.BackgroundColor3 = Color3.fromRGB(28, 28, 34)
+    row.BorderSizePixel = 0
+    row.Parent = Content
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -80, 0, 20)
+    lbl.Position = UDim2.new(0, 12, 0, 6)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = text
+    lbl.TextColor3 = Color3.fromRGB(220, 220, 225)
+    lbl.TextSize = 12
+    lbl.Font = Enum.Font.Gotham
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = row
+
+    local valLbl = Instance.new("TextLabel")
+    valLbl.Size = UDim2.new(0, 60, 0, 20)
+    valLbl.Position = UDim2.new(1, -70, 0, 6)
+    valLbl.BackgroundTransparency = 1
+    valLbl.Text = string.format("%.2f%s", Config[configKey], suffix or "")
+    valLbl.TextColor3 = accent
+    valLbl.TextSize = 12
+    valLbl.Font = Enum.Font.GothamBold
+    valLbl.Parent = row
+
+    local barBg = Instance.new("Frame")
+    barBg.Size = UDim2.new(1, -24, 0, 6)
+    barBg.Position = UDim2.new(0, 12, 0, 34)
+    barBg.BackgroundColor3 = Color3.fromRGB(50, 50, 58)
+    barBg.BorderSizePixel = 0
+    barBg.Parent = row
+    Instance.new("UICorner", barBg).CornerRadius = UDim.new(1, 0)
+
+    local barFill = Instance.new("Frame")
+    local pct = (Config[configKey] - min) / (max - min)
+    barFill.Size = UDim2.new(pct, 0, 1, 0)
+    barFill.BackgroundColor3 = accent
+    barFill.BorderSizePixel = 0
+    barFill.Parent = barBg
+    Instance.new("UICorner", barFill).CornerRadius = UDim.new(1, 0)
+
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, 0, 1, 0)
+    btn.Position = UDim2.new(0, 0, 0, -8)
+    btn.BackgroundTransparency = 1
+    btn.Text = ""
+    btn.Parent = barBg
+
+    local dragging = false
+    local function update(input)
+        local rel = (input.Position.X - barBg.AbsolutePosition.X) / barBg.AbsoluteSize.X
+        rel = math.clamp(rel, 0, 1)
+        local val = min + rel * (max - min)
+        Config[configKey] = val
+        barFill.Size = UDim2.new(rel, 0, 1, 0)
+        valLbl.Text = string.format("%.2f%s", val, suffix or "")
+        if callback then callback(val) end
+    end
+    btn.MouseButton1Down:Connect(function() dragging = true end)
+    UserInputService.InputEnded:Connect(function(i) if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end end)
+    UserInputService.InputChanged:Connect(function(i)
+        if dragging and i.UserInputType == Enum.UserInputType.MouseMovement then update(i) end
+    end)
+    return row
+end
+
+local function makeButton(text, onClick)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, 0, 0, 36)
+    btn.BackgroundColor3 = accent
+    btn.Text = text
+    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    btn.TextSize = 13
+    btn.Font = Enum.Font.GothamBold
+    btn.Parent = Content
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 8)
+    btn.MouseButton1Click:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.1), {BackgroundColor3 = Color3.fromRGB(200, 140, 30)}):Play()
+        task.delay(0.12, function() TweenService:Create(btn, TweenInfo.new(0.15), {BackgroundColor3 = accent}):Play() end)
+        onClick()
+    end)
+    return btn
+end
+
+--// Xây dựng menu
+makeSection("ESP Vịt")
+makeToggle("Bật ESP Vịt", "ESP_Enabled")
+makeToggle("Highlight (toàn viền)", "ESP_UseHighlight")
+makeToggle("Hiển thị tên", "ESP_Name")
+makeToggle("Hiển thị khoảng cách", "ESP_Distance")
+makeToggle("Đường kẻ Tracer", "ESP_Tracer")
+makeSlider("Khoảng cách ESP tối đa", "ESP_MaxDistance", 200, 5000, " studs")
+
+makeSection("Aimbot")
+makeToggle("Bật Aimbot", "Aim_Enabled")
+makeToggle("Chế độ Toggle (bấm 1 lần)", "Aim_Toggle")
+makeSlider("FOV (bán kính ngắm)", "Aim_FOV", 50, 600, " px")
+makeSlider("Độ mượt (0=instant)", "Aim_Smooth", 0, 0.9, "")
+makeSlider("Đoán trước chuyển động", "Aim_Prediction", 0, 0.5, "s")
+
+makeSection("Auto Kill")
+makeToggle("Bật Auto Kill (bắn tự động)", "AutoKill_Enabled", function(on)
+    if on then scanShootRemotes() end
+end)
+makeToggle("Aim tức thì khi auto", "AutoKill_InstantAim")
+makeSlider("Delay giữa 2 lần bắn", "AutoKill_Delay", 0.05, 1, "s")
+makeSlider("Tầm bắn tối đa", "AutoKill_Range", 50, 5000, " studs", function(v)
+    Config.AutoKill_Range = v
+end)
+
+makeSection("Công cụ")
+makeButton("🔄 Quét lại vịt + remote", function()
+    scanDucks()
+    scanShootRemotes()
+    -- Toast
+    local t = Instance.new("TextLabel")
+    t.Size = UDim2.new(0, 220, 0, 30)
+    t.Position = UDim2.new(0.5, -110, 0.85, 0)
+    t.BackgroundColor3 = Color3.fromRGB(30, 143, 99)
+    t.Text = "✓ Đã quét lại. Remote tìm thấy: " .. #State.ShootRemotes
+    t.TextColor3 = Color3.fromRGB(255, 255, 255)
+    t.TextSize = 12
+    t.Font = Enum.Font.GothamBold
+    t.Parent = ScreenGui
+    Instance.new("UICorner", t).CornerRadius = UDim.new(0, 8)
+    task.delay(2.5, function() t:Destroy() end)
+end)
+makeButton("📋 Danh sách remote đã tìm", function()
+    local names = {}
+    for _, r in ipairs(State.ShootRemotes) do
+        if r and r.Parent then table.insert(names, r:GetFullName()) end
+    end
+    local msg = #names > 0 and table.concat(names, "\n") or "Chưa tìm thấy remote nào — bấm Quét lại khi đang cầm súng."
+    if setclipboard then setclipboard(msg) end
+    warn("[VitHub] Remotes:\n" .. msg)
+end)
+
+--// Footer
+local footer = Instance.new("TextLabel")
+footer.Size = UDim2.new(1, 0, 0, 24)
+footer.BackgroundTransparency = 1
+footer.Text = "Phím RightControl để ẩn/hiện menu · Chuột phải để aim"
+footer.TextColor3 = Color3.fromRGB(120, 120, 130)
+footer.TextSize = 10
+footer.Font = Enum.Font.Gotham
+footer.Parent = Content
+
+--// Khởi tạo: quét ngay
+task.spawn(function()
+    scanDucks()
+    scanShootRemotes()
+    -- Tự tạo ESP cho vịt đã tìm thấy
+    for duck in pairs(State.Ducks) do createEsp(duck) end
+    for duck in pairs(scanDucks()) do
+        if Config.ESP_Enabled then createEsp(duck) end
+    end
+end)
+
+--// Dọn dẹp khi script load lại
+if getgenv then
+    getgenv()._BatVitHub_Unload = function()
+        ScreenGui:Destroy()
+        if EspFolder then EspFolder:Destroy() end
+        for duck in pairs(State.Ducks) do removeEsp(duck) end
+    end
+end
+
+print("🦆 [VitHub] Loaded! RightControl = ẩn/hiện menu.")
