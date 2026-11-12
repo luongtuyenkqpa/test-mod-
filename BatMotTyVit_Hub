@@ -1,0 +1,878 @@
+--// ============================================================
+--//  VỊT HUB v2 — ESP | Aimbot | Auto Kill | Rapid Fire | Vô hạn đạn | Auto Gom Vịt
+--//  Hỗ trợ 2 Place:
+--//    • [Boss] Bắt một tỷ vịt        (PlaceId: 100293509865504)
+--//    • Bắn vịt FPS (Ngày/Nạp lại)   (PlaceId: 120617974337690)
+--// ============================================================
+
+if getgenv and getgenv()._VitHubV2_Loaded then
+    pcall(function() getgenv()._VitHubV2_Loaded:Destroy() end)
+end
+
+--// Services
+local Players          = game:GetService("Players")
+local LocalPlayer      = Players.LocalPlayer
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService     = game:GetService("TweenService")
+local ReplicatedStorage= game:GetService("ReplicatedStorage")
+local CURRENT_PLACE_ID = game.PlaceId
+
+--// ============================================================
+--//  CONFIG
+--// ============================================================
+local Config = {
+    -- ESP
+    ESP_Enabled      = true,
+    ESP_Color        = Color3.fromRGB(255, 190, 40),
+    ESP_UseHighlight = true,
+    ESP_Name         = true,
+    ESP_Distance     = true,
+    ESP_Tracer       = true,
+    ESP_MaxDistance  = 2500,
+    -- Aimbot
+    Aim_Enabled      = false,
+    Aim_Toggle       = false,
+    Aim_FOV          = 220,
+    Aim_Smooth       = 0.30,
+    Aim_Prediction   = 0.12,
+    -- Auto Kill
+    AutoKill_Enabled = false,
+    AutoKill_Delay   = 0.15,
+    AutoKill_Range   = 5000,
+    AutoKill_InstantAim = true,
+    -- Vũ khí
+    RapidFire_Enabled   = false,
+    RapidFire_Rate      = 0.03,          -- giây giữa 2 phát (nhỏ = nhanh)
+    InfiniteAmmo_Enabled= false,
+    -- Gom vịt
+    AutoCollect_Enabled = false,
+    AutoCollect_Radius  = 250,           -- studs, gom vịt rơi trong bán kính này
+    -- Khác
+    MenuKey          = Enum.KeyCode.RightControl,
+    Accent           = Color3.fromRGB(255, 185, 50),
+}
+
+local State = {
+    MenuOpen      = true,
+    AimHolding    = false,
+    Ducks         = {},
+    ShootRemotes  = {},
+    CollectRemotes= {},
+    AmmoValues    = {},
+    ScanTick      = 0,
+    CurrentTab    = "ESP",
+}
+
+--// ============================================================
+--//  UTIL
+--// ============================================================
+local function safe(f, ...)
+    local ok, r = pcall(f, ...)
+    return ok and r or nil
+end
+
+local function getRootPart(m)
+    if not m or not m.Parent then return nil end
+    if m:IsA("BasePart") then return m end
+    for _, n in ipairs({"HumanoidRootPart","RootPart","Torso","Head","UpperTorso","PrimaryPart"}) do
+        local p = m:FindFirstChild(n)
+        if p and p:IsA("BasePart") then return p end
+    end
+    if m.PrimaryPart then return m.PrimaryPart end
+    for _, p in ipairs(m:GetDescendants()) do
+        if p:IsA("BasePart") then return p end
+    end
+    return nil
+end
+
+local function getDuckVelocity(m)
+    local r = getRootPart(m)
+    return r and (r.Velocity or r.AssemblyLinearVelocity or Vector3.zero) or Vector3.zero
+end
+
+local function getTargetPos(duck)
+    local r = getRootPart(duck); if not r then return nil end
+    local pos = r.Position
+    local head = duck:FindFirstChild("Head")
+    if head and head:IsA("BasePart") then pos = head.Position end
+    if Config.Aim_Prediction > 0 then
+        pos = pos + getDuckVelocity(duck) * Config.Aim_Prediction
+    end
+    return pos
+end
+
+local function nameMatches(name, pats)
+    local low = string.lower(tostring(name or ""))
+    for _, p in ipairs(pats) do
+        if string.find(low, string.lower(p), 1, true) then return true end
+    end
+    return false
+end
+
+--// ============================================================
+--//  PHÁT HIỆN VỊT (adaptive cho cả 2 game)
+--// ============================================================
+local DUCK_PATS   = {"duck","vit","vịt","bird","mallard","goose","ngỗng","ngong","duckling","convit","target","mob","npc","animal","enemy","flying","bay","chicken","ga","gà","pigeon","seagull","hawk","eagle","crow","sparrow","convit","dead","fall","rơi","loot"}
+local FOLDER_PATS = {"duck","vit","vịt","bird","npc","mob","animal","entity","target","enemy","wildlife","spawn","flying","ducks","birds"}
+local BLACK_PATS  = {"player","local","camera","terrain","baseplate","map","world","weapon","tool","gun","sung","súng","bullet","projectile","effect","particle","debris","sound","gui","menu","shop","cua","hang","cửa hàng","reward","phần thưởng","index","chi muc","chỉ mục","code","ma","mã"}
+
+local function isBlacklisted(n) return nameMatches(n, BLACK_PATS) end
+
+local function isPlayerChar(m)
+    for _, p in ipairs(Players:GetPlayers()) do if p.Character == m then return true end end
+    return false
+end
+
+local function looksLikeDuck(m)
+    if not m or not m:IsA("Model") then return false end
+    if isPlayerChar(m) then return false end
+    if isBlacklisted(m.Name) then return false end
+    if m:FindFirstChildOfClass("Humanoid") then return true end
+    if nameMatches(m.Name, DUCK_PATS) then return true end
+    local par = m.Parent
+    while par and par ~= workspace do
+        if nameMatches(par.Name, FOLDER_PATS) and not isBlacklisted(par.Name) then return true end
+        par = par.Parent
+    end
+    return false
+end
+
+local function isDeadOrFalling(duck)
+    -- Vịt đã bị bắn rơi: Humanoid chết / tên có dead/fall/rơi / đang rơi tự do
+    local hum = duck:FindFirstChildOfClass("Humanoid")
+    if hum and hum.Health <= 0 then return true end
+    if nameMatches(duck.Name, {"dead","fall","rơi","loot","caught","bat","bắt","collected"}) then return true end
+    local r = getRootPart(duck)
+    if r then
+        local v = r.Velocity or r.AssemblyLinearVelocity or Vector3.zero
+        if v.Y < -8 and math.abs(v.X) < 30 and math.abs(v.Z) < 30 then return true end -- đang rơi thẳng
+    end
+    return false
+end
+
+local function scanDucks()
+    local found = {}
+    local function chk(o)
+        if looksLikeDuck(o) and getRootPart(o) then found[o] = true end
+    end
+    for _, c in ipairs(workspace:GetChildren()) do
+        if c:IsA("Model") then
+            chk(c)
+            for _, s in ipairs(c:GetChildren()) do if s:IsA("Model") then chk(s) end end
+        elseif c:IsA("Folder") then
+            for _, s in ipairs(c:GetChildren()) do if s:IsA("Model") then chk(s) end end
+        end
+    end
+    return found
+end
+
+--// ============================================================
+--//  QUÉT REMOTE (bắn + gom vịt) + GIÁ TRỊ ĐẠN
+--// ============================================================
+local SHOOT_PATS   = {"shoot","fire","ban","bắn","attack","hit","damage","kill","catch","bắt","bat","vit","vịt","duck","bullet","projectile","weapon","gun","sung","súng","shot","fireshot"}
+local COLLECT_PATS = {"collect","gom","nhặt","pickup","pick","catch","bắt","bat","reward","loot","nhan","nhận","claim","gather","tele","tp","magnet","hut","hút"}
+local AMMO_PATS    = {"ammo","đạn","dan","bullet","clip","reload","nap","nạp","maxammo","currentammo","ammocount","shots","dancon","đạn còn"}
+
+local function scanRemotes()
+    State.ShootRemotes, State.CollectRemotes = {}, {}
+    local conts = {ReplicatedStorage, workspace}
+    local char = LocalPlayer.Character; if char then table.insert(conts, char) end
+    local tool = safe(function() for _, c in ipairs(char:GetChildren()) do if c:IsA("Tool") then return c end end end)
+    if tool then table.insert(conts, tool) end
+    for _, cont in ipairs(conts) do
+        safe(function()
+            for _, d in ipairs(cont:GetDescendants()) do
+                if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
+                    if nameMatches(d.Name, SHOOT_PATS) and not isBlacklisted(d.Name) then
+                        table.insert(State.ShootRemotes, d)
+                    elseif nameMatches(d.Name, COLLECT_PATS) and not isBlacklisted(d.Name) then
+                        table.insert(State.CollectRemotes, d)
+                    end
+                end
+            end
+        end)
+    end
+    -- bỏ trùng (clean rebuild)
+    local seen = {}
+    local shootUniq, collectUniq = {}, {}
+    for _, r in ipairs(State.ShootRemotes) do
+        if r and not seen[r] then seen[r] = true; table.insert(shootUniq, r) end
+    end
+    for _, r in ipairs(State.CollectRemotes) do
+        if r and not seen[r] then seen[r] = true; table.insert(collectUniq, r) end
+    end
+    State.ShootRemotes = shootUniq
+    State.CollectRemotes = collectUniq
+end
+
+-- Quét giá trị đạn (IntValue/NumberValue/Attribute)
+local function scanAmmoValues()
+    State.AmmoValues = {}
+    local conts = {LocalPlayer, LocalPlayer:WaitForChild("leaderstats", 3)}
+    local char = LocalPlayer.Character; if char then table.insert(conts, char) end
+    local tool = char and safe(function() for _, c in ipairs(char:GetChildren()) do if c:IsA("Tool") then return c end end end)
+    if tool then table.insert(conts, tool) end
+    for _, cont in ipairs(conts) do
+        if not cont then continue end
+        safe(function()
+            for _, d in ipairs(cont:GetDescendants()) do
+                if (d:IsA("IntValue") or d:IsA("NumberValue")) and nameMatches(d.Name, AMMO_PATS) then
+                    table.insert(State.AmmoValues, d)
+                end
+            end
+        end)
+        -- Attributes
+        safe(function()
+            for _, attr in ipairs(cont:GetAttributes()) do
+                if nameMatches(attr, AMMO_PATS) then
+                    table.insert(State.AmmoValues, {obj=cont, attr=attr})
+                end
+            end
+        end)
+    end
+end
+
+local function refillAmmo()
+    for _, av in ipairs(State.AmmoValues) do
+        safe(function()
+            if type(av) == "table" and av.obj then
+                local cur = av.obj:GetAttribute(av.attr)
+                if typeof(cur) == "number" then av.obj:SetAttribute(av.attr, 9999) end
+            elseif av and av.Parent then
+                if av:IsA("IntValue") or av:IsA("NumberValue") then
+                    av.Value = 9999
+                end
+            end
+        end)
+    end
+end
+
+--// ============================================================
+--//  ESP
+--// ============================================================
+local EspFolder = safe(function()
+    local f = Instance.new("Folder"); f.Name = "VitHubV2_ESP"
+    f.Parent = gethui and gethui() or game:GetService("CoreGui"); return f
+end) or Instance.new("Folder", workspace)
+
+local function removeEsp(d)
+    local t = State.Ducks[d]; if not t then return end
+    safe(function() if t.hl then t.hl:Destroy() end end)
+    safe(function() if t.bb then t.bb:Destroy() end end)
+    safe(function() if t.tr then t.tr.Visible=false; t.tr:Remove() end end)
+    State.Ducks[d] = nil
+end
+
+local function createEsp(duck)
+    if State.Ducks[duck] then return end
+    local root = getRootPart(duck); if not root then return end
+    local hl
+    if Config.ESP_UseHighlight then
+        hl = Instance.new("Highlight")
+        hl.FillColor = Config.ESP_Color; hl.FillTransparency = 0.55
+        hl.OutlineColor = Config.ESP_Color; hl.OutlineTransparency = 0
+        hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        hl.Adornee = duck; hl.Parent = EspFolder
+    end
+    local bb = Instance.new("BillboardGui")
+    bb.Adornee = root; bb.Size = UDim2.new(0,130,0,38); bb.StudsOffset = Vector3.new(0,2.5,0)
+    bb.AlwaysOnTop = true; bb.Parent = EspFolder
+    local nl = Instance.new("TextLabel", bb)
+    nl.BackgroundTransparency=1; nl.Size=UDim2.new(1,0,0.5,0)
+    nl.Font=Enum.Font.GothamBold; nl.TextSize=13; nl.TextColor3=Color3.new(1,1,1)
+    nl.TextStrokeTransparency=0.4; nl.Text="🦆 VỊT"
+    local dl = Instance.new("TextLabel", bb)
+    dl.BackgroundTransparency=1; dl.Position=UDim2.new(0,0,0.5,0); dl.Size=UDim2.new(1,0,0.5,0)
+    dl.Font=Enum.Font.Gotham; dl.TextSize=11; dl.TextColor3=Config.ESP_Color; dl.TextStrokeTransparency=0.5; dl.Text=""
+    local tr = nil
+    if Drawing and Drawing.new then safe(function() tr=Drawing.new("Line"); tr.Visible=false; tr.Color=Config.ESP_Color; tr.Thickness=1.5; tr.Transparency=0.8 end) end
+    State.Ducks[duck] = {hl=hl, bb=bb, nl=nl, dl=dl, tr=tr, root=root}
+end
+
+local function updateEsp()
+    State.ScanTick = State.ScanTick + 1
+    if State.ScanTick % 90 == 0 then
+        local found = scanDucks()
+        for d in pairs(State.Ducks) do if not found[d] or not d.Parent then removeEsp(d) end end
+        for d in pairs(found) do if Config.ESP_Enabled then createEsp(d) end end
+        if State.ScanTick % 300 == 0 then scanRemotes(); scanAmmoValues() end
+    end
+    local cam = workspace.CurrentCamera
+    local myChar = LocalPlayer.Character
+    local myRoot = myChar and safe(function() return myChar.PrimaryPart or myChar:FindFirstChild("HumanoidRootPart") end)
+    for duck, t in pairs(State.Ducks) do
+        if not duck.Parent or not getRootPart(duck) then removeEsp(duck); continue end
+        local on = Config.ESP_Enabled
+        if t.hl then t.hl.Enabled = on and Config.ESP_UseHighlight end
+        if t.bb then t.bb.Enabled = on and (Config.ESP_Name or Config.ESP_Distance) end
+        if not on then if t.tr then t.tr.Visible=false end; continue end
+        local pos = t.root.Position
+        local dist = myRoot and (myRoot.Position - pos).Magnitude or 0
+        if dist > Config.ESP_MaxDistance then
+            if t.hl then t.hl.Enabled=false end
+            if t.bb then t.bb.Enabled=false end
+            if t.tr then t.tr.Visible=false end
+        else
+            if t.dl then t.dl.Text = Config.ESP_Distance and string.format("%.0f studs", dist) or "" end
+            if t.nl then t.nl.Text = Config.ESP_Name and "🦆 VỊT" or "" end
+            if Config.ESP_Tracer and t.tr and cam then
+                local vec, onScr = cam:WorldToViewportPoint(pos)
+                if onScr then
+                    t.tr.From = Vector2.new(cam.ViewportSize.X/2, cam.ViewportSize.Y)
+                    t.tr.To = Vector2.new(vec.X, vec.Y); t.tr.Visible=true; t.tr.Color=Config.ESP_Color
+                else t.tr.Visible=false end
+            elseif t.tr then t.tr.Visible=false end
+        end
+    end
+end
+
+--// ============================================================
+--//  AIMBOT + FIRE
+--// ============================================================
+local function findBestTarget()
+    local cam = workspace.CurrentCamera
+    local ctr = Vector2.new(cam.ViewportSize.X/2, cam.ViewportSize.Y/2)
+    local best, bd = nil, Config.Aim_FOV
+    local myChar = LocalPlayer.Character
+    local myRoot = myChar and safe(function() return myChar.PrimaryPart or myChar:FindFirstChild("HumanoidRootPart") end)
+    for duck in pairs(State.Ducks) do
+        if duck.Parent and not isDeadOrFalling(duck) then
+            local pos = getTargetPos(duck)
+            if pos then
+                local vec, onScr = cam:WorldToViewportPoint(pos)
+                if onScr and vec.Z>0 then
+                    local d = (Vector2.new(vec.X,vec.Y)-ctr).Magnitude
+                    if d < bd then
+                        local d3 = myRoot and (myRoot.Position-pos).Magnitude or 0
+                        if d3 <= Config.AutoKill_Range then best, bd = duck, d end
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function aimAt(pos, smooth)
+    local cam = workspace.CurrentCamera
+    local goal = CFrame.new(cam.CFrame.Position, pos)
+    if smooth and smooth > 0.01 then cam.CFrame = cam.CFrame:Lerp(goal, 1-smooth)
+    else cam.CFrame = goal end
+end
+
+local function getTool()
+    local char = LocalPlayer.Character; if not char then return nil end
+    for _, c in ipairs(char:GetChildren()) do if c:IsA("Tool") then return c end end
+    return nil
+end
+
+local function fireOnce(targetDuck)
+    local fired = false
+    local tool = getTool()
+    if tool then
+        safe(function() tool:Activate(); fired=true end)
+        safe(function()
+            for _, d in ipairs(tool:GetDescendants()) do
+                if d:IsA("RemoteEvent") then
+                    local p = getTargetPos(targetDuck)
+                    pcall(function() d:FireServer(targetDuck, p) end)
+                    pcall(function() d:FireServer(p) end)
+                    pcall(function() d:FireServer(targetDuck) end)
+                    pcall(function() d:FireServer() end)
+                    fired=true
+                elseif d:IsA("RemoteFunction") then
+                    local p = getTargetPos(targetDuck)
+                    pcall(function() d:InvokeServer(targetDuck, p) end)
+                    pcall(function() d:InvokeServer(p) end)
+                    pcall(function() d:InvokeServer() end)
+                    fired=true
+                end
+            end
+        end)
+    end
+    for _, r in ipairs(State.ShootRemotes) do
+        if r and r.Parent then
+            local p = getTargetPos(targetDuck)
+            if r:IsA("RemoteEvent") then
+                pcall(function() r:FireServer(targetDuck, p) end)
+                pcall(function() r:FireServer(p) end)
+                pcall(function() r:FireServer(targetDuck) end)
+                pcall(function() r:FireServer() end)
+                fired=true
+            else
+                pcall(function() r:InvokeServer(targetDuck, p) end)
+                pcall(function() r:InvokeServer(p) end)
+                pcall(function() r:InvokeServer() end)
+                fired=true
+            end
+        end
+    end
+    return fired
+end
+
+--// Auto Kill loop
+task.spawn(function()
+    while true do
+        task.wait(Config.AutoKill_Delay)
+        if Config.AutoKill_Enabled then
+            if #State.ShootRemotes==0 then scanRemotes() end
+            local t = findBestTarget()
+            if t then
+                local pos = getTargetPos(t)
+                if pos then
+                    if Config.AutoKill_InstantAim then aimAt(pos, 0) else aimAt(pos, Config.Aim_Smooth) end
+                    task.wait(0.02)
+                    fireOnce(t)
+                end
+            end
+        end
+    end
+end)
+
+--// Rapid Fire loop (bắn liên thanh)
+task.spawn(function()
+    while true do
+        task.wait(Config.RapidFire_Rate)
+        if Config.RapidFire_Enabled then
+            -- Bắn vào vịt gần nhất (nếu có aimbot/autokill thì đã aim sẵn)
+            local t = findBestTarget()
+            fireOnce(t)
+        end
+    end
+end)
+
+--// Vô hạn đạn loop — nạp đầy đạn liên tục
+task.spawn(function()
+    while true do
+        task.wait(0.4)
+        if Config.InfiniteAmmo_Enabled then
+            if #State.AmmoValues == 0 then scanAmmoValues() end
+            refillAmmo()
+            -- Gọi luôn remote nạp đạn (reload) nếu có
+            for _, r in ipairs(State.ShootRemotes) do
+                if r and r.Parent and nameMatches(r.Name, {"reload","nap","nạp"}) then
+                    if r:IsA("RemoteEvent") then pcall(function() r:FireServer() end)
+                    else pcall(function() r:InvokeServer() end) end
+                end
+            end
+        end
+    end
+end)
+
+--// Auto Gom Vịt — hút vịt đã bắn rơi về chỗ đứng
+task.spawn(function()
+    while true do
+        task.wait(0.15)
+        if Config.AutoCollect_Enabled then
+            local myChar = LocalPlayer.Character
+            local myRoot = myChar and safe(function() return myChar.PrimaryPart or myChar:FindFirstChild("HumanoidRootPart") end)
+            if not myRoot then continue end
+            for duck in pairs(State.Ducks) do
+                if duck.Parent and isDeadOrFalling(duck) then
+                    local r = getRootPart(duck)
+                    if r then
+                        local dist = (r.Position - myRoot.Position).Magnitude
+                        if dist < Config.AutoCollect_Radius then
+                            -- Teleport vịt về ngay trên đầu người chơi để tự rơi nhặt
+                            safe(function()
+                                r.CFrame = CFrame.new(myRoot.Position + Vector3.new(0, 3, 0))
+                                r.Velocity = Vector3.new(0, -2, 0)
+                            end)
+                            -- Gọi remote gom/nhặt nếu có
+                            for _, cr in ipairs(State.CollectRemotes) do
+                                if cr and cr.Parent then
+                                    if cr:IsA("RemoteEvent") then
+                                        pcall(function() cr:FireServer(duck) end)
+                                        pcall(function() cr:FireServer(duck, r.Position) end)
+                                        pcall(function() cr:FireServer() end)
+                                    else
+                                        pcall(function() cr:InvokeServer(duck) end)
+                                        pcall(function() cr:InvokeServer() end)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end)
+
+--// Render loop
+RunService.RenderStepped:Connect(function()
+    updateEsp()
+    local aimOn = Config.Aim_Enabled and State.AimHolding
+    if aimOn then
+        local t = findBestTarget()
+        if t then
+            local pos = getTargetPos(t)
+            if pos then aimAt(pos, Config.Aim_Smooth) end
+        end
+    end
+end)
+
+--// Input
+UserInputService.InputBegan:Connect(function(i, gpe)
+    if gpe then return end
+    if i.UserInputType == Config.Aim_Key or i.KeyCode == Config.Aim_Key then State.AimHolding = true end
+    if i.KeyCode == Config.MenuKey then
+        State.MenuOpen = not State.MenuOpen
+        if State.MenuFrame then State.MenuFrame.Visible = State.MenuOpen end
+    end
+end)
+UserInputService.InputEnded:Connect(function(i)
+    if (i.UserInputType == Config.Aim_Key or i.KeyCode == Config.Aim_Key) and not Config.Aim_Toggle then
+        State.AimHolding = false
+    end
+end)
+
+--// ============================================================
+--//  GUI v2 — Ngang gọn gàng + Nút bật tắt nổi
+--// ============================================================
+local function getGuiParent()
+    if gethui then local ok,h=pcall(gethui); if ok and h then return h end end
+    if syn and syn.protect_gui then return game:GetService("CoreGui") end
+    local ok,c=pcall(function() return game:GetService("CoreGui") end); if ok and c then return c end
+    return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local SG = Instance.new("ScreenGui")
+SG.Name = "VitHubV2"; SG.ResetOnSpawn=false; SG.ZIndexBehavior=Enum.ZIndexBehavior.Sibling; SG.IgnoreGuiInset=true
+if syn and syn.protect_gui then pcall(syn.protect_gui, SG) end
+SG.Parent = getGuiParent()
+if getgenv then getgenv()._VitHubV2_Loaded = SG end
+
+local accent = Config.Accent
+local DARK   = Color3.fromRGB(20, 20, 26)
+local CARD   = Color3.fromRGB(30, 30, 38)
+local TEXT   = Color3.fromRGB(225, 225, 230)
+local MUTED  = Color3.fromRGB(130, 130, 140)
+
+--// ── NÚT BẬT TẮT NỔI (floating toggle button) ──
+local FloatBtn = Instance.new("TextButton")
+FloatBtn.Name = "FloatToggle"
+FloatBtn.Size = UDim2.new(0, 46, 0, 46)
+FloatBtn.Position = UDim2.new(1, -60, 0.5, -23)
+FloatBtn.BackgroundColor3 = accent
+FloatBtn.Text = "🦆"
+FloatBtn.TextSize = 22
+FloatBtn.Font = Enum.Font.GothamBold
+FloatBtn.AutoButtonColor = false
+FloatBtn.Active = true
+FloatBtn.Draggable = true
+FloatBtn.Parent = SG
+Instance.new("UICorner", FloatBtn).CornerRadius = UDim.new(1, 0)
+local fbStroke = Instance.new("UIStroke"); fbStroke.Color=Color3.new(1,1,1); fbStroke.Thickness=1.5; fbStroke.Transparency=0.3; fbStroke.Parent=FloatBtn
+-- hiệu ứng nhấp nháy nhẹ
+task.spawn(function()
+    while FloatBtn.Parent do
+        TweenService:Create(FloatBtn, TweenInfo.new(1.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {
+            BackgroundColor3 = Color3.fromRGB(220, 150, 30)
+        }):Play()
+        task.wait(2.4)
+    end
+end)
+
+--// ── MENU CHÍNH (ngang, gọn) ──
+local Menu = Instance.new("Frame")
+Menu.Name = "Menu"
+Menu.Size = UDim2.new(0, 660, 0, 400)
+Menu.Position = UDim2.new(0.5, -330, 0.5, -200)
+Menu.BackgroundColor3 = DARK
+Menu.BorderSizePixel = 0
+Menu.Active = true
+Menu.Draggable = true
+Menu.Visible = State.MenuOpen
+Menu.Parent = SG
+State.MenuFrame = Menu
+Instance.new("UICorner", Menu).CornerRadius = UDim.new(0, 14)
+local mStroke = Instance.new("UIStroke"); mStroke.Color=accent; mStroke.Thickness=1.2; mStroke.Transparency=0.25; mStroke.Parent=Menu
+
+FloatBtn.MouseButton1Click:Connect(function()
+    State.MenuOpen = not State.MenuOpen
+    Menu.Visible = State.MenuOpen
+    TweenService:Create(FloatBtn, TweenInfo.new(0.15), {Size=UDim2.new(0,40,0,40)}):Play()
+    task.delay(0.15, function() TweenService:Create(FloatBtn, TweenInfo.new(0.15), {Size=UDim2.new(0,46,0,46)}):Play() end)
+end)
+
+--// Header (ngang)
+local Header = Instance.new("Frame")
+Header.Size = UDim2.new(1, 0, 0, 40)
+Header.BackgroundColor3 = Color3.fromRGB(26, 26, 32)
+Header.BorderSizePixel = 0
+Header.Parent = Menu
+local hc = Instance.new("UICorner", Header); hc.CornerRadius = UDim.new(0, 14)
+local hFix = Instance.new("Frame", Header); hFix.Size=UDim2.new(1,0,0.5,0); hFix.Position=UDim2.new(0,0,0.5,0); hFix.BackgroundColor3=Color3.fromRGB(26,26,32); hFix.BorderSizePixel=0
+local hGrad = Instance.new("UIGradient", Header)
+hGrad.Color = ColorSequence.new({ColorSequenceKeypoint.new(0, accent), ColorSequenceKeypoint.new(1, Color3.fromRGB(120,70,10))})
+hGrad.Rotation = 90
+
+local Title = Instance.new("TextLabel", Header)
+Title.Size=UDim2.new(0,260,1,0); Title.Position=UDim2.new(0,14,0,0)
+Title.BackgroundTransparency=1; Title.Text="🦆 VỊT HUB v2  ·  Place: "..tostring(CURRENT_PLACE_ID)
+Title.TextColor3=Color3.new(1,1,1); Title.TextSize=13; Title.Font=Enum.Font.GothamBold; Title.TextXAlignment=Enum.TextXAlignment.Left
+
+local CloseBtn = Instance.new("TextButton", Header)
+CloseBtn.Size=UDim2.new(0,30,0,22); CloseBtn.Position=UDim2.new(1,-38,0,9)
+CloseBtn.BackgroundColor3=Color3.fromRGB(180,50,60); CloseBtn.Text="✕"; CloseBtn.TextColor3=Color3.new(1,1,1)
+CloseBtn.TextSize=12; CloseBtn.Font=Enum.Font.GothamBold
+Instance.new("UICorner", CloseBtn).CornerRadius=UDim.new(0,6)
+CloseBtn.MouseButton1Click:Connect(function() State.MenuOpen=false; Menu.Visible=false end)
+
+--// Tab bar (ngang — các nút tab xếp hàng ngang)
+local TabBar = Instance.new("Frame")
+TabBar.Size = UDim2.new(1, -16, 0, 36)
+TabBar.Position = UDim2.new(0, 8, 0, 46)
+TabBar.BackgroundTransparency = 1
+TabBar.Parent = Menu
+local tabList = Instance.new("UIListLayout", TabBar)
+tabList.FillDirection = Enum.FillDirection.Horizontal
+tabList.HorizontalAlignment = Enum.HorizontalAlignment.Left
+tabList.Padding = UDim.new(0, 6)
+tabList.SortOrder = Enum.SortOrder.LayoutOrder
+
+--// Content area (grid 2 cột cho gọn)
+local Content = Instance.new("ScrollingFrame")
+Content.Size = UDim2.new(1, -20, 1, -96)
+Content.Position = UDim2.new(0, 10, 0, 88)
+Content.BackgroundTransparency = 1
+Content.BorderSizePixel = 0
+Content.ScrollBarThickness = 4
+Content.ScrollBarImageColor3 = accent
+Content.CanvasSize = UDim2.new(0,0,0,0)
+Content.AutomaticCanvasSize = Enum.AutomaticSize.Y
+Content.Parent = Menu
+local grid = Instance.new("UIGridLayout", Content)
+grid.CellSize = UDim2.new(0.5, -6, 0, 44)
+grid.CellPadding = UDim2.new(0, 6, 0, 6)
+grid.SortOrder = Enum.SortOrder.LayoutOrder
+grid.FillDirectionMaxCells = 2
+
+local TABS = {"ESP", "AIMBOT", "VŨ KHÍ", "GOM VỊT", "CÔNG CỤ"}
+local TabButtons = {}
+local TabContents = {} -- [tabName] = {items}
+
+local function clearContent()
+    for _, c in ipairs(Content:GetChildren()) do
+        if c:IsA("Frame") or c:IsA("TextButton") or c:IsA("TextLabel") then c:Destroy() end
+    end
+end
+
+local function makeToggle(text, key, tab, cb)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, -8, 1, -4)
+    row.Position = UDim2.new(0, 4, 0, 2)
+    row.BackgroundColor3 = CARD
+    row.BorderSizePixel = 0
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 7)
+    local lbl = Instance.new("TextLabel", row)
+    lbl.Size=UDim2.new(1,-52,1,0); lbl.Position=UDim2.new(0,10,0,0)
+    lbl.BackgroundTransparency=1; lbl.Text=text; lbl.TextColor3=TEXT; lbl.TextSize=11.5
+    lbl.Font=Enum.Font.Gotham; lbl.TextXAlignment=Enum.TextXAlignment.Left
+    local tg = Instance.new("TextButton", row)
+    tg.Size=UDim2.new(0,36,0,18); tg.Position=UDim2.new(1,-44,0.5,-9)
+    tg.BackgroundColor3 = Config[key] and accent or Color3.fromRGB(70,70,80)
+    tg.Text=""; tg.AutoButtonColor=false
+    Instance.new("UICorner", tg).CornerRadius=UDim.new(1,0)
+    local knob = Instance.new("Frame", tg)
+    knob.Size=UDim2.new(0,14,0,14); knob.BorderSizePixel=0
+    knob.Position = Config[key] and UDim2.new(1,-16,0.5,-7) or UDim2.new(0,2,0.5,-7)
+    knob.BackgroundColor3=Color3.new(1,1,1)
+    Instance.new("UICorner", knob).CornerRadius=UDim.new(1,0)
+    tg.MouseButton1Click:Connect(function()
+        Config[key] = not Config[key]
+        TweenService:Create(tg, TweenInfo.new(0.15), {BackgroundColor3=Config[key] and accent or Color3.fromRGB(70,70,80)}):Play()
+        TweenService:Create(knob, TweenInfo.new(0.15), {Position=Config[key] and UDim2.new(1,-16,0.5,-7) or UDim2.new(0,2,0.5,-7)}):Play()
+        if cb then cb(Config[key]) end
+    end)
+    table.insert(TabContents[tab], row)
+    return row
+end
+
+local function makeSlider(text, key, mn, mx, suf, tab, cb)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, -8, 1, -4)
+    row.Position = UDim2.new(0, 4, 0, 2)
+    row.BackgroundColor3 = CARD
+    row.BorderSizePixel = 0
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 7)
+    local lbl = Instance.new("TextLabel", row)
+    lbl.Size=UDim2.new(1,-10,0,14); lbl.Position=UDim2.new(0,8,0,3)
+    lbl.BackgroundTransparency=1; lbl.Text=text; lbl.TextColor3=TEXT; lbl.TextSize=10.5
+    lbl.Font=Enum.Font.Gotham; lbl.TextXAlignment=Enum.TextXAlignment.Left
+    local vl = Instance.new("TextLabel", row)
+    vl.Size=UDim2.new(0,60,0,14); vl.Position=UDim2.new(1,-66,0,3)
+    vl.BackgroundTransparency=1; vl.Text=string.format("%.2f%s", Config[key], suf or ""); vl.TextColor3=accent
+    vl.TextSize=10.5; vl.Font=Enum.Font.GothamBold; vl.TextXAlignment=Enum.TextXAlignment.Right
+    local barBg = Instance.new("Frame", row)
+    barBg.Size=UDim2.new(1,-16,0,5); barBg.Position=UDim2.new(0,8,1,-9)
+    barBg.BackgroundColor3=Color3.fromRGB(55,55,65); barBg.BorderSizePixel=0
+    Instance.new("UICorner", barBg).CornerRadius=UDim.new(1,0)
+    local fill = Instance.new("Frame", barBg)
+    local pct = (Config[key]-mn)/(mx-mn); fill.Size=UDim2.new(pct,0,1,0)
+    fill.BackgroundColor3=accent; fill.BorderSizePixel=0
+    Instance.new("UICorner", fill).CornerRadius=UDim.new(1,0)
+    local btn = Instance.new("TextButton", barBg)
+    btn.Size=UDim2.new(1,0,1,0); btn.Position=UDim2.new(0,0,0,-6); btn.BackgroundTransparency=1; btn.Text=""
+    local drag=false
+    local function upd(i)
+        local rel=(i.Position.X - barBg.AbsolutePosition.X)/barBg.AbsoluteSize.X
+        rel=math.clamp(rel,0,1); local v=mn+rel*(mx-mn); Config[key]=v
+        fill.Size=UDim2.new(rel,0,1,0); vl.Text=string.format("%.2f%s",v,suf or "")
+        if cb then cb(v) end
+    end
+    btn.MouseButton1Down:Connect(function() drag=true end)
+    UserInputService.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then drag=false end end)
+    UserInputService.InputChanged:Connect(function(i) if drag and i.UserInputType==Enum.UserInputType.MouseMovement then upd(i) end end)
+    table.insert(TabContents[tab], row)
+    return row
+end
+
+local function makeButton(text, tab, onClick)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, -8, 1, -4)
+    btn.Position = UDim2.new(0, 4, 0, 2)
+    btn.BackgroundColor3 = accent
+    btn.Text = text
+    btn.TextColor3 = Color3.new(1,1,1)
+    btn.TextSize = 11.5
+    btn.Font = Enum.Font.GothamBold
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 7)
+    btn.MouseButton1Click:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.1), {BackgroundColor3=Color3.fromRGB(200,140,30)}):Play()
+        task.delay(0.12, function() TweenService:Create(btn, TweenInfo.new(0.15), {BackgroundColor3=accent}):Play() end)
+        onClick()
+    end)
+    table.insert(TabContents[tab], btn)
+    return btn
+end
+
+local function makeSectionLabel(text, tab)
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, 0, 1, -4)
+    lbl.Position = UDim2.new(0, 4, 0, 2)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = "▸ " .. text
+    lbl.TextColor3 = accent
+    lbl.TextSize = 12
+    lbl.Font = Enum.Font.GothamBold
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    table.insert(TabContents[tab], lbl)
+    return lbl
+end
+
+-- Khởi tạo tab contents
+for _, t in ipairs(TABS) do TabContents[t] = {} end
+
+--// ── Xây dựng nội dung từng tab ──
+makeToggle("Bật ESP Vịt", "ESP_Enabled", "ESP")
+makeToggle("Highlight xuyên tường", "ESP_UseHighlight", "ESP")
+makeToggle("Hiển thị tên", "ESP_Name", "ESP")
+makeToggle("Khoảng cách", "ESP_Distance", "ESP")
+makeToggle("Đường kẻ Tracer", "ESP_Tracer", "ESP")
+makeSlider("Tầm ESP tối đa", "ESP_MaxDistance", 200, 5000, " studs", "ESP")
+
+makeToggle("Bật Aimbot", "Aim_Enabled", "AIMBOT")
+makeToggle("Toggle (bấm 1 lần)", "Aim_Toggle", "AIMBOT")
+makeToggle("Auto Kill (tự bắn)", "AutoKill_Enabled", "AIMBOT", function(on) if on then scanRemotes() end end)
+makeToggle("Aim tức thì (auto)", "AutoKill_InstantAim", "AIMBOT")
+makeSlider("FOV ngắm", "Aim_FOV", 50, 600, " px", "AIMBOT")
+makeSlider("Độ mượt", "Aim_Smooth", 0, 0.9, "", "AIMBOT")
+makeSlider("Đoán trước bay", "Aim_Prediction", 0, 0.5, "s", "AIMBOT")
+makeSlider("Delay auto bắn", "AutoKill_Delay", 0.05, 1, "s", "AIMBOT")
+makeSlider("Tầm bắn", "AutoKill_Range", 50, 5000, " studs", "AIMBOT")
+
+makeToggle("🔥 Bắn liên thanh", "RapidFire_Enabled", "VŨ KHÍ")
+makeSlider("Tốc độ (delay/phát)", "RapidFire_Rate", 0.01, 0.3, "s", "VŨ KHÍ")
+makeToggle("♾️ Vô hạn đạn", "InfiniteAmmo_Enabled", "VŨ KHÍ", function(on) if on then scanAmmoValues() end end)
+
+makeToggle("🧲 Auto gom vịt rơi", "AutoCollect_Enabled", "GOM VỊT")
+makeSlider("Bán kính hút vịt", "AutoCollect_Radius", 20, 500, " studs", "GOM VỊT")
+
+makeSectionLabel("Quét & Chẩn đoán", "CÔNG CỤ")
+makeButton("🔄 Quét vịt + remote + đạn", "CÔNG CỤ", function()
+    scanDucks(); scanRemotes(); scanAmmoValues()
+    for d in pairs(scanDucks()) do if Config.ESP_Enabled then createEsp(d) end end
+    local t = Instance.new("TextLabel")
+    t.Size=UDim2.new(0,280,0,34); t.Position=UDim2.new(0.5,-140,0.82,0)
+    t.BackgroundColor3=Color3.fromRGB(30,143,99); t.TextColor3=Color3.new(1,1,1)
+    t.Text=string.format("✓ Vịt:%d | Remote bắn:%d | Remote gom:%d | Giá trị đạn:%d",
+        (function() local n=0; for _ in pairs(State.Ducks) do n=n+1 end; return n end)(),
+        #State.ShootRemotes, #State.CollectRemotes, #State.AmmoValues)
+    t.TextSize=11.5; t.Font=Enum.Font.GothamBold; t.Parent=SG
+    Instance.new("UICorner", t).CornerRadius=UDim.new(0,8)
+    task.delay(3, function() t:Destroy() end)
+end)
+makeButton("📋 Copy danh sách remote", "CÔNG CỤ", function()
+    local out = {"== REMOTE BẮN =="}
+    for _, r in ipairs(State.ShootRemotes) do if r and r.Parent then table.insert(out, r:GetFullName()) end end
+    table.insert(out, "== REMOTE GOM VỊT ==")
+    for _, r in ipairs(State.CollectRemotes) do if r and r.Parent then table.insert(out, r:GetFullName()) end end
+    table.insert(out, "== GIÁ TRỊ ĐẠN ==")
+    for _, a in ipairs(State.AmmoValues) do
+        if type(a)=="table" and a.obj then table.insert(out, a.obj:GetFullName().."."..a.attr)
+        elseif a and a.Parent then table.insert(out, a:GetFullName().." = "..tostring(a.Value)) end
+    end
+    local msg = table.concat(out, "\n")
+    if setclipboard then setclipboard(msg) end
+    warn("[VitHub v2]\n"..msg)
+end)
+
+--// Hiển thị tab
+local function showTab(name)
+    State.CurrentTab = name
+    clearContent()
+    for _, item in ipairs(TabContents[name]) do
+        item.Parent = Content
+    end
+    for tabName, btn in pairs(TabButtons) do
+        btn.BackgroundColor3 = (tabName == name) and accent or Color3.fromRGB(40, 40, 48)
+        btn.TextColor3 = (tabName == name) and Color3.new(1,1,1) or MUTED
+    end
+end
+
+--// Tạo nút tab (ngang)
+for i, tname in ipairs(TABS) do
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(0, 110, 1, -4)
+    b.Position = UDim2.new(0, 0, 0, 2)
+    b.BackgroundColor3 = (i == 1) and accent or Color3.fromRGB(40, 40, 48)
+    b.Text = tname
+    b.TextColor3 = (i == 1) and Color3.new(1,1,1) or MUTED
+    b.TextSize = 12
+    b.Font = Enum.Font.GothamBold
+    b.LayoutOrder = i
+    b.Parent = TabBar
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
+    TabButtons[tname] = b
+    b.MouseButton1Click:Connect(function() showTab(tname) end)
+end
+showTab("ESP")
+
+--// Footer ngắn
+local footer = Instance.new("TextLabel")
+footer.Size = UDim2.new(1, -16, 0, 18)
+footer.Position = UDim2.new(0, 8, 1, -22)
+footer.BackgroundTransparency = 1
+footer.Text = "RightControl = ẩn/hiện · Nút 🦆 nổi = bật/tắt menu · Chuột phải = aim"
+footer.TextColor3 = MUTED
+footer.TextSize = 10
+footer.Font = Enum.Font.Gotham
+footer.Parent = Menu
+
+--// Khởi tạo
+task.spawn(function()
+    scanDucks(); scanRemotes(); scanAmmoValues()
+    for d in pairs(scanDucks()) do if Config.ESP_Enabled then createEsp(d) end end
+end)
+
+if getgenv then
+    getgenv()._VitHubV2_Unload = function()
+        SG:Destroy(); if EspFolder then EspFolder:Destroy() end
+        for d in pairs(State.Ducks) do removeEsp(d) end
+    end
+end
+
+print("🦆 [VitHub v2] Loaded! Hỗ trợ Place: " .. tostring(CURRENT_PLACE_ID))
